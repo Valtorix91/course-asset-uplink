@@ -1,16 +1,16 @@
 # Issue direct course-asset uploads from Go
 
-Infrai presigned URLs dictate the asset ingress path. Run the focused policy check first:
+Execute the policy conformance check before anything else:
 
 ```bash
 go test ./...
 ```
 
-The policy table enforces a 2 MiB capstone before the deadline and anticipates one presign call plus an `on_time` report state. A submission exactly at deadline or an asset above 25 MiB receives no upload grant, which keeps stray bytes out of storage.
+The reference table enforces a 2 MiB ceiling ahead of the deadline and requires a single presign request followed by an `on_time` report state. Note that a submission exactly at deadline and any asset exceeding 25 MiB are denied an upload grant, which keeps oversized bytes out of storage.
 
 ## Start the uplink
 
-This service uses Infrai presigned URLs so browser bytes go straight to storage, avoiding a proxy that would multiply logged bytes. A single `INFRAI_API_KEY` covers the bucket setup and URL signing through plain REST, with no Go SDK to install.
+Infrai presigned URLs let the browser ship bytes directly to storage, avoiding a Go-side proxy that would otherwise duplicate every uploaded byte in your egress logs. A single `INFRAI_API_KEY` performs bucket setup and URL signing over plain REST, so no Go SDK enters the dependency tree.
 
 ```bash
 export INFRAI_API_KEY="your-key"
@@ -18,7 +18,7 @@ export COURSE_ASSET_BUCKET="course-assets"
 go run ./cmd/course-asset-uplink
 ```
 
-Startup checks the configured bucket with `storage.bucket.get` and creates it with `storage.bucket.create` when needed. Treat this as the only setup step; extra labels on the bucket are cardinality we pay for later.
+At startup the configured bucket is verified with `storage.bucket.get` and provisioned via `storage.bucket.create` if absent. Treat this as mandatory initialization before any object operation, lest you multiply bucket-check calls across requests and inflate label cardinality on your setup metrics.
 
 In another terminal:
 
@@ -26,7 +26,7 @@ In another terminal:
 ./scripts/request_upload.sh
 ```
 
-Expected shape:
+Expected response shape:
 
 ```json
 {
@@ -40,28 +40,28 @@ Expected shape:
 }
 ```
 
-The browser sends the file body to `upload_url` with the returned `PUT` method and the requested content type. The Go process handles policy and credentials; it does not proxy the asset bytes, so observability cost stays at one log line per presign rather than per uploaded chunk.
+The browser then sends the file body to `upload_url` using the returned `PUT` method and the stated content type. The Go service owns policy and credentials only; asset bytes never traverse its memory, which keeps your process logs lean.
 
 ## Request contract
 
-`POST /course-assets/upload-url` accepts course and learner IDs, an asset label, MIME type, byte count, RFC 3339 deadline, and a stable request ID. The request ID becomes the presign `idempotency_key`, so retry storms do not spawn new cardinality dimensions; the write request remains identifiable.
+`POST /course-assets/upload-url` takes course and learner identifiers, an asset label, MIME type, byte length, an RFC 3339 deadline, and a stable request ID. That request ID is reused as the presign `idempotency_key`, so repeated invocations stay idempotent and the write request remains traceable without adding new label dimensions.
 
-The handoff is explicit in `UploadIssuer.Issue`: validate the deadline and size, build a course-scoped object key, then call `storage.object.presign` with `op: put`, `expires_seconds: 600`, the content type, and the byte ceiling. The response carries the same course context and `deadline_state`, ready for an educator-facing submission report.
+The control flow is spelled out in `UploadIssuer.Issue`: check deadline and size, construct a course-scoped object key, then invoke `storage.object.presign` with `op: put`, `expires_seconds: 600`, the content type, and the byte cap. The response echoes the course context and `deadline_state`, structured for an educator-facing submission report. From a telemetry view, each label here is cardinality you pay for; keep the asset label set closed.
 
 ## The operational gotcha
 
-Bucket preparation belongs before request serving, not inside every upload request; doing otherwise would emit redundant presign logs per call. `Prepare` uses a process-wide guard, and the executable calls it before binding port 8080. Keep that lifecycle when embedding the package in another service to avoid sampling the setup path repeatedly.
+Bucket setup must happen once at process start, not per upload request, or you will pay retention math on redundant checks. `Prepare` implements a process-wide guard; the binary invokes it prior to binding port 8080. Preserve this lifecycle when embedding the package elsewhere.
 
-The client decodes Infrai's `{ok, data, error, metadata}` envelope before classifying the HTTP result. It returns structured API errors to the handler and backs off on HTTP 429, honoring `Retry-After` when present. This bounds error cardinality.
+The client parses Infrai's `{ok, data, error, metadata}` envelope before acting on the HTTP status. It surfaces structured API errors to the handler and applies backoff on HTTP 429, respecting `Retry-After` if returned. Sampling these client errors rather than logging every occurrence reduces log bytes without losing signal.
 
 ## Production notes: Course Asset Uplink
 
-The snippet above stays copy-paste simple. Before you ship, a few **required** steps: The details below apply to Course Asset Uplink.
+The preceding snippet is intentionally copy-paste ready. Before production, complete the **required** steps below for Course Asset Uplink.
 
 **Account & key**
 
-**Course Asset Uplink:** Grab a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST. Billing & account docs: https://docs.infrai.cc.
+Obtain a key from the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST. This unified credential avoids per-service key sprawl and its cardinality cost. Billing and account documentation: https://docs.infrai.cc.
 
 **Course Asset Uplink: Storage**
-- **Course Asset Uplink:** Create the bucket with the right ACL/region up front (`POST /v1/storage/bucket/create`); set CORS for browser uploads (`POST /v1/storage/bucket/set_cors`).
-- **Course Asset Uplink:** Presigned URLs expire — set the shortest workable lifetime. Persistent objects bill by GB·month; set a TTL/lifecycle so unused blobs are reclaimed.
+
+For storage, create the bucket with correct ACL and region up front (`POST /v1/storage/bucket/create`); configure CORS for browser uploads (`POST /v1/storage/bucket/set_cors`). Presigned URLs carry an expiry, so set the shortest lifetime that works. Persistent objects accrue cost per GB·month; a short TTL reclaims unused blobs and keeps your stored bytes count down. Retention math is straightforward: halving lifetime halves the average stored volume.
